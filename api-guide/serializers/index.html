@@ -5052,6 +5052,7 @@ AccountSerializer():
         read_only_fields = ['account_name']
 </code></pre></div>
 <p>Model fields which have <code>editable=False</code> set, and <code>AutoField</code> fields will be set to read-only by default, and do not need to be added to the <code>read_only_fields</code> option.</p>
+<p>Please keep in mind that, if a field has already been explicitly declared on the serializer class (or a parent class), then the <code>read_only_fields</code> option will not apply to that field. Set <code>read_only=True</code> on the field itself instead.</p>
 <div class="admonition note">
 <p class="admonition-title">Note</p>
 <p>There is a special-case where a read-only field is part of a <code>unique_together</code> constraint at the model level. In this case the field is required by the serializer class in order to validate the constraint, but should also not be editable by the user.</p>
@@ -5079,7 +5080,7 @@ AccountSerializer():
         user.save()
         return user
 </code></pre></div>
-<p>Please keep in mind that, if the field has already been explicitly declared on the serializer class, then the <code>extra_kwargs</code> option will be ignored.</p>
+<p>Please keep in mind that, if the field has already been explicitly declared on the serializer class, then the <code>extra_kwargs</code> option will be ignored. The same is true of <code>read_only_fields</code>, which is implemented using <code>extra_kwargs</code>.</p>
 <h3 id="relational-fields">Relational fields<a class="headerlink" href="#relational-fields" title="Permanent link">&para;</a></h3>
 <p>When serializing model instances, there are a number of different ways you might choose to represent relationships.  The default representation for <code>ModelSerializer</code> is to use the primary keys of the related instances.</p>
 <p>Alternative representations include serializing using hyperlinks, serializing complete nested representations, or serializing with a custom representation.</p>
