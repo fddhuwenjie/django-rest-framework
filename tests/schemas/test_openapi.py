@@ -4,20 +4,23 @@ import warnings
 import pytest
 from django.db import models
 from django.test import RequestFactory, TestCase, override_settings
-from django.urls import path
+from django.urls import include, path, re_path
 from django.utils.safestring import SafeString
 from django.utils.translation import gettext_lazy as _
 
-from rest_framework import filters, generics, pagination, routers, serializers
+from rest_framework import filters, generics, pagination, routers, serializers, viewsets
 from rest_framework.authtoken.views import obtain_auth_token
 from rest_framework.compat import uritemplate
+from rest_framework.decorators import action
 from rest_framework.parsers import JSONParser, MultiPartParser
 from rest_framework.renderers import (
     BaseRenderer, BrowsableAPIRenderer, JSONOpenAPIRenderer, JSONRenderer,
     OpenAPIRenderer
 )
 from rest_framework.request import Request
+from rest_framework.schemas.generators import EndpointEnumerator
 from rest_framework.schemas.openapi import AutoSchema, SchemaGenerator
+from rest_framework.views import APIView
 
 from ..models import BasicModel
 from . import views
@@ -244,6 +247,48 @@ class TestOperationIntrospection(TestCase):
                 },
             },
         }
+
+    def test_path_parameter_schema_from_converter(self):
+        path = '/example/{pk}/'
+        method = 'GET'
+
+        view = create_view(
+            views.DocStringExampleDetailView,
+            method,
+            create_request(path)
+        )
+        inspector = AutoSchema()
+        inspector.view = view
+
+        # Without converter information (e.g. regex routes, or schemas built
+        # by hand) the parameter falls back to a plain string.
+        assert inspector.get_path_parameter_schema('pk') == {'type': 'string'}
+
+        view.path_converters = {
+            'pk': 'int',
+            'uuid': 'uuid',
+            'slug': 'slug',
+            'str': 'str',
+            'custom': 'some_custom_converter',
+        }
+
+        # `int` converters map to an integer schema.
+        assert inspector.get_path_parameter_schema('pk') == {'type': 'integer'}
+        # `uuid` converters map to a string schema with a `uuid` format.
+        assert inspector.get_path_parameter_schema('uuid') == {
+            'type': 'string', 'format': 'uuid'
+        }
+        # String-like, unknown or custom converters cannot be mapped reliably
+        # and fall back to a plain string schema.
+        assert inspector.get_path_parameter_schema('slug') == {'type': 'string'}
+        assert inspector.get_path_parameter_schema('str') == {'type': 'string'}
+        assert inspector.get_path_parameter_schema('custom') == {'type': 'string'}
+
+        # The returned schema is a copy and must not mutate the
+        # class-level converter mapping.
+        schema = inspector.get_path_parameter_schema('pk')
+        schema['format'] = 'int64'
+        assert inspector.get_path_parameter_schema('pk') == {'type': 'integer'}
 
     def test_request_body(self):
         path = '/'
@@ -1189,6 +1234,140 @@ class TestGenerator(TestCase):
 
         assert '/api/example/' in paths
         assert '/api/example/{id}/' in paths
+
+    def test_get_path_and_converters(self):
+        enumerator = EndpointEnumerator(patterns=[])
+
+        # `path()` converters are reported alongside the variable.
+        route, converters = enumerator.get_path_and_converters('/items/<int:pk>/')
+        assert route == '/items/{pk}/'
+        assert converters == {'pk': 'int'}
+
+        route, converters = enumerator.get_path_and_converters(
+            '/items/<uuid:pk>/extra/<slug:slug>/'
+        )
+        assert route == '/items/{pk}/extra/{slug}/'
+        assert converters == {'pk': 'uuid', 'slug': 'slug'}
+
+        # Variables without a converter (e.g. regex named groups) map to None.
+        route, converters = enumerator.get_path_and_converters('/items/(?P<pk>[0-9]+)/')
+        assert route == '/items/{pk}/'
+        assert converters == {'pk': None}
+
+    def test_path_converter_parameters(self):
+        """`path()` converters determine the path parameter schema types."""
+        class IntDetailView(APIView):
+            def get(self, request, **kwargs):
+                pass
+
+        class UuidDetailView(APIView):
+            def get(self, request, **kwargs):
+                pass
+
+        class SlugDetailView(APIView):
+            def get(self, request, **kwargs):
+                pass
+
+        class StrDetailView(APIView):
+            def get(self, request, **kwargs):
+                pass
+
+        class BareDetailView(APIView):
+            def get(self, request, **kwargs):
+                pass
+
+        class RegexDetailView(APIView):
+            def get(self, request, **kwargs):
+                pass
+
+        class NestedUuidDetailView(APIView):
+            def get(self, request, **kwargs):
+                pass
+
+        patterns = [
+            path('ints/<int:pk>/', IntDetailView.as_view()),
+            path('uuids/<uuid:uuid>/', UuidDetailView.as_view()),
+            path('slugs/<slug:slug>/', SlugDetailView.as_view()),
+            path('strings/<str:name>/', StrDetailView.as_view()),
+            path('bare/<pk>/', BareDetailView.as_view()),
+            re_path(r'^regexes/(?P<pk>[0-9]+)/$', RegexDetailView.as_view()),
+            path('api/<int:version>/', include([
+                path('items/<uuid:item_uuid>/', NestedUuidDetailView.as_view()),
+            ])),
+        ]
+
+        generator = SchemaGenerator(patterns=patterns)
+        schema = generator.get_schema()
+
+        def path_parameter(route, name):
+            parameters = schema['paths'][route]['get']['parameters']
+            [parameter] = [p for p in parameters if p['name'] == name]
+            assert parameter['in'] == 'path'
+            assert parameter['required'] is True
+            return parameter['schema']
+
+        # The `int` converter produces an integer schema.
+        assert path_parameter('/ints/{id}/', 'id') == {'type': 'integer'}
+        # The `uuid` converter produces a string schema with a uuid format.
+        assert path_parameter('/uuids/{uuid}/', 'uuid') == {
+            'type': 'string', 'format': 'uuid'
+        }
+        # String-like converters fall back to a plain string schema.
+        assert path_parameter('/slugs/{slug}/', 'slug') == {'type': 'string'}
+        assert path_parameter('/strings/{name}/', 'name') == {'type': 'string'}
+        assert path_parameter('/bare/{id}/', 'id') == {'type': 'string'}
+        # Regex routes are unchanged and keep producing string schemas.
+        assert path_parameter('/regexes/{id}/', 'id') == {'type': 'string'}
+        # Converters declared on an included prefix are honored as well.
+        nested_route = '/api/{version}/items/{item_uuid}/'
+        assert path_parameter(nested_route, 'version') == {'type': 'integer'}
+        assert path_parameter(nested_route, 'item_uuid') == {
+            'type': 'string', 'format': 'uuid'
+        }
+
+    def test_router_path_converter_parameters(self):
+        """Routers using `path()` routes honor the lookup converter."""
+        class UuidItemViewSet(viewsets.ViewSet):
+            lookup_value_converter = 'uuid'
+
+            def retrieve(self, request, pk=None):
+                pass
+
+        class StrItemViewSet(viewsets.ViewSet):
+            def retrieve(self, request, pk=None):
+                pass
+
+        class ActionItemViewSet(viewsets.ViewSet):
+            def retrieve(self, request, pk=None):
+                pass
+
+            @action(detail=True, url_path='history/<int:year>')
+            def history(self, request, pk=None, year=None):
+                pass
+
+        router = routers.SimpleRouter(use_regex_path=False)
+        router.register('uuid-items', UuidItemViewSet, basename='uuid-item')
+        router.register('str-items', StrItemViewSet, basename='str-item')
+        router.register('action-items', ActionItemViewSet, basename='action-item')
+
+        generator = SchemaGenerator(patterns=router.urls)
+        schema = generator.get_schema()
+
+        def path_parameter(route, name):
+            parameters = schema['paths'][route]['get']['parameters']
+            [parameter] = [p for p in parameters if p['name'] == name]
+            return parameter['schema']
+
+        # The viewset's `lookup_value_converter` drives the detail parameter.
+        assert path_parameter('/uuid-items/{id}/', 'id') == {
+            'type': 'string', 'format': 'uuid'
+        }
+        # The default (`str`) converter falls back to a plain string schema.
+        assert path_parameter('/str-items/{id}/', 'id') == {'type': 'string'}
+        # Converters used in a dynamic route's `url_path` are honored too.
+        action_route = '/action-items/{id}/history/{year}/'
+        assert path_parameter(action_route, 'id') == {'type': 'string'}
+        assert path_parameter(action_route, 'year') == {'type': 'integer'}
 
     def test_schema_construction(self):
         """Construction of the top level dictionary."""

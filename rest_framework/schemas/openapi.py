@@ -138,6 +138,16 @@ class AutoSchema(ViewInspector):
         'delete': 'destroy',
     }
 
+    # Map Django `path()` route converters to their OpenAPI path parameter
+    # schema. Converters that are not listed here (e.g. 'str', 'slug', 'path'
+    # or any custom converter) cannot be reliably mapped and fall back to a
+    # plain string schema.
+    # https://docs.djangoproject.com/en/stable/topics/http/urls/#path-converters
+    path_converter_schemas = {
+        'int': {'type': 'integer'},
+        'uuid': {'type': 'string', 'format': 'uuid'},
+    }
+
     def get_operation(self, path, method):
         operation = {}
 
@@ -266,6 +276,21 @@ class AutoSchema(ViewInspector):
 
         return action + name
 
+    def get_path_parameter_schema(self, variable):
+        """
+        Return the schema for a templated path variable.
+
+        When the route was declared with Django's ``path()`` and the variable
+        uses a registered converter, the converter determines the schema type
+        (e.g. ``int`` -> integer, ``uuid`` -> string with ``uuid`` format).
+        Regex routes, string-like converters and any converter that cannot be
+        reliably mapped fall back to a plain string schema.
+        """
+        path_converters = getattr(self.view, 'path_converters', {})
+        converter = path_converters.get(variable)
+        # Return a copy so callers cannot mutate the shared class mapping.
+        return dict(self.path_converter_schemas.get(converter, {'type': 'string'}))
+
     def get_path_parameters(self, path, method):
         """
         Return a list of parameters from templated path variables.
@@ -294,9 +319,7 @@ class AutoSchema(ViewInspector):
                 "in": "path",
                 "required": True,
                 "description": description,
-                'schema': {
-                    'type': 'string',  # TODO: integer, pattern, ...
-                },
+                'schema': self.get_path_parameter_schema(variable),
             }
             parameters.append(parameter)
 

@@ -34,7 +34,7 @@ def is_api_view(callback):
 
 
 def endpoint_ordering(endpoint):
-    path, method, callback = endpoint
+    path, method, callback, path_converters = endpoint
     method_priority = {
         'GET': 0,
         'POST': 1,
@@ -72,6 +72,12 @@ class EndpointEnumerator:
     def get_api_endpoints(self, patterns=None, prefix=''):
         """
         Return a list of all available API endpoints by inspecting the URL conf.
+
+        Endpoints are ``(path, method, callback, path_converters)`` tuples,
+        where ``path_converters`` maps each templated path variable to its
+        Django ``path()`` converter (e.g. ``{'pk': 'int'}``). Variables that
+        do not use a converter (such as those declared with a regex route) map
+        to ``None``.
         """
         if patterns is None:
             patterns = self.patterns
@@ -81,11 +87,11 @@ class EndpointEnumerator:
         for pattern in patterns:
             path_regex = prefix + str(pattern.pattern)
             if isinstance(pattern, URLPattern):
-                path = self.get_path_from_regex(path_regex)
+                path, path_converters = self.get_path_and_converters(path_regex)
                 callback = pattern.callback
                 if self.should_include_endpoint(path, callback):
                     for method in self.get_allowed_methods(callback):
-                        endpoint = (path, method, callback)
+                        endpoint = (path, method, callback, path_converters)
                         api_endpoints.append(endpoint)
 
             elif isinstance(pattern, URLResolver):
@@ -101,14 +107,25 @@ class EndpointEnumerator:
         """
         Given a URL conf regex, return a URI template string.
         """
-        # ???: Would it be feasible to adjust this such that we generate the
-        # path, plus the kwargs, plus the type from the converter, such that we
-        # could feed that straight into the parameter schema object?
+        path, _ = self.get_path_and_converters(path_regex)
+        return path
 
+    def get_path_and_converters(self, path_regex):
+        """
+        Given a URL conf regex, return a URI template string and a mapping of
+        the path variables to their Django ``path()`` converters (``None`` when
+        the variable does not use a converter, e.g. for regex routes).
+        """
         path = simplify_regex(path_regex)
 
+        path_converters = {
+            match.group('parameter'): match.group('converter')
+            for match in _PATH_PARAMETER_COMPONENT_RE.finditer(path)
+        }
+
         # Strip Django 2.0 converters as they are incompatible with uritemplate format
-        return re.sub(_PATH_PARAMETER_COMPONENT_RE, r'{\g<parameter>}', path)
+        path = re.sub(_PATH_PARAMETER_COMPONENT_RE, r'{\g<parameter>}', path)
+        return path, path_converters
 
     def should_include_endpoint(self, path, callback):
         """
@@ -176,8 +193,9 @@ class BaseSchemaGenerator:
         """
         paths = []
         view_endpoints = []
-        for path, method, callback in self.endpoints:
+        for path, method, callback, path_converters in self.endpoints:
             view = self.create_view(callback, method, request)
+            view.path_converters = path_converters
             path = self.coerce_path(path, method, view)
             paths.append(path)
             view_endpoints.append((path, method, view))
@@ -220,6 +238,10 @@ class BaseSchemaGenerator:
             field_name = get_pk_name(model)
         else:
             field_name = 'id'
+        # Keep any converter metadata aligned with the renamed path variable.
+        path_converters = getattr(view, 'path_converters', None)
+        if path_converters is not None and 'pk' in path_converters:
+            path_converters[field_name] = path_converters.pop('pk')
         return path.replace('{pk}', '{%s}' % field_name)
 
     def get_schema(self, request=None, public=False):
