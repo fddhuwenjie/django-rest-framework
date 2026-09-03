@@ -1,13 +1,15 @@
 """
 Provides an APIView class that is the base of all views in REST framework.
 """
+from http.client import responses
+
 from django.conf import settings
 from django.core.exceptions import PermissionDenied
 from django.db import connections, models
 from django.http import Http404
 from django.http.response import HttpResponseBase
 from django.utils.cache import patch_vary_headers
-from django.utils.encoding import smart_str
+from django.utils.encoding import force_str, smart_str
 from django.views.decorators.csrf import csrf_exempt
 from django.views.generic import View
 
@@ -100,6 +102,164 @@ def exception_handler(exc, context):
         return Response(data, status=exc.status_code, headers=headers)
 
     return None
+
+
+# Media type used for RFC 9457 "Problem Details" responses.
+PROBLEM_JSON_MEDIA_TYPE = 'application/problem+json'
+
+# Members that are defined by RFC 9457 (`type`, `title`, `status`, `detail`,
+# `instance`) together with the `errors` extension member emitted by this
+# handler. Custom extension members (provided through `APIException`'s
+# `problem_extensions`) are never allowed to override them.
+PROBLEM_DETAILS_RESERVED_MEMBERS = frozenset({
+    'type', 'title', 'status', 'detail', 'instance', 'errors'
+})
+
+
+def _problem_json_pointer_token(token):
+    """
+    Escape a single JSON Pointer reference token, as described by RFC 6901.
+    `~` must be escaped as `~0` before `/` is escaped as `~1`.
+    """
+    return str(token).replace('~', '~0').replace('/', '~1')
+
+
+def _flatten_problem_details(detail, pointer=''):
+    """
+    Walk the nested structure of an `APIException.detail` value and flatten
+    every leaf error into an entry for the problem details `errors` extension.
+
+    Each entry records the location of the error as a JSON Pointer (RFC 6901),
+    together with its human readable `detail` message and its original
+    `ErrorDetail.code`. Dictionary keys are escaped reference tokens and list
+    indices are preserved as numeric tokens. A leaf error that is not tied to
+    a particular field (a single, non structured detail) has no `pointer`.
+    """
+    errors = []
+    if isinstance(detail, dict):
+        for field, value in detail.items():
+            errors.extend(_flatten_problem_details(
+                value, '%s/%s' % (pointer, _problem_json_pointer_token(field))
+            ))
+    elif isinstance(detail, (list, tuple)):
+        for index, value in enumerate(detail):
+            errors.extend(_flatten_problem_details(
+                value, '%s/%d' % (pointer, index)
+            ))
+    else:
+        error = {
+            'detail': force_str(detail),
+            'code': getattr(detail, 'code', None),
+        }
+        if pointer:
+            error = {'pointer': pointer, **error}
+        errors.append(error)
+    return errors
+
+
+def _build_problem_details(exc, context):
+    """
+    Build the RFC 9457 problem details object for an `APIException`.
+    """
+    request = context.get('request')
+
+    problem_type = getattr(exc, 'problem_type', None) or 'about:blank'
+    title = getattr(exc, 'problem_title', None) or responses.get(exc.status_code, '')
+
+    data = {
+        'type': force_str(problem_type),
+        'title': force_str(title),
+        'status': exc.status_code,
+    }
+
+    if isinstance(exc.detail, (list, dict)):
+        # Structured validation errors are never flattened into a single
+        # string. Every leaf error is exposed through the `errors` extension,
+        # preserving the nested structure as JSON Pointers.
+        data['detail'] = force_str(getattr(exc, 'default_detail', ''))
+        data['errors'] = _flatten_problem_details(exc.detail)
+    else:
+        data['detail'] = force_str(exc.detail)
+        data['errors'] = [{
+            'detail': force_str(exc.detail),
+            'code': getattr(exc.detail, 'code', None),
+        }]
+
+    if request is not None:
+        # The relative URI of the request, including any query string.
+        data['instance'] = request.get_full_path()
+
+    # Custom extension members. Standard members always take precedence and
+    # can never be overridden.
+    extensions = getattr(exc, 'problem_extensions', None)
+    if extensions:
+        for key, value in extensions.items():
+            if key not in PROBLEM_DETAILS_RESERVED_MEMBERS:
+                data[key] = value
+
+    return data
+
+
+def _problem_details_media_type(context):
+    """
+    Return the media type for a problem details response.
+
+    Problem details are a JSON format, so the response is served as
+    `application/problem+json` when the negotiated renderer produces JSON.
+    HTML renderers (such as the browsable API) keep their usual media type,
+    so that their behavior is unchanged when this handler is enabled.
+    """
+    request = context.get('request')
+    renderer = getattr(request, 'accepted_renderer', None)
+    if renderer is not None and getattr(renderer, 'media_type', None) == 'text/html':
+        return None
+    return PROBLEM_JSON_MEDIA_TYPE
+
+
+def problem_details_exception_handler(exc, context):
+    """
+    Returns the response that should be used for any given exception,
+    formatted as an RFC 9457 "Problem Details" object.
+
+    By default we handle the REST framework `APIException`, and also Django's
+    built-in `Http404` and `PermissionDenied` exceptions. Any unhandled
+    exceptions return `None`, which will cause a 500 error to be raised.
+
+    The response body contains the standard `type`, `title`, `status`,
+    `detail` and `instance` members, plus an `errors` extension that preserves
+    every validation error with its JSON Pointer and error code. Responses are
+    rendered with the `application/problem+json` media type.
+
+    Enable it with the `EXCEPTION_HANDLER` setting:
+
+        REST_FRAMEWORK = {
+            'EXCEPTION_HANDLER':
+                'rest_framework.views.problem_details_exception_handler'
+        }
+    """
+    if isinstance(exc, Http404):
+        exc = exceptions.NotFound(*(exc.args))
+    elif isinstance(exc, PermissionDenied):
+        exc = exceptions.PermissionDenied(*(exc.args))
+
+    if not isinstance(exc, exceptions.APIException):
+        return None
+
+    headers = {}
+    if getattr(exc, 'auth_header', None):
+        headers['WWW-Authenticate'] = exc.auth_header
+    if getattr(exc, 'wait', None):
+        headers['Retry-After'] = '%d' % exc.wait
+
+    data = _build_problem_details(exc, context)
+
+    set_rollback()
+    return Response(
+        data,
+        status=exc.status_code,
+        headers=headers,
+        content_type=_problem_details_media_type(context),
+    )
 
 
 class APIView(View):
