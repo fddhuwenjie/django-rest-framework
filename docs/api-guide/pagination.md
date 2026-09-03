@@ -81,6 +81,7 @@ Proper usage of pagination should have an ordering field that satisfies the foll
 
 * Should be an unchanging value, such as a timestamp, slug, or other field that is only set once, on creation.
 * Should be unique, or nearly unique if using `CursorPagination`. The `CursorPagination` implementation uses a smart "position plus offset" style that allows it to properly support not-strictly-unique values as the ordering. Millisecond precision timestamps are a good example.
+* When ordering `CursorPagination` by a non-unique field, give `ordering` as a list or tuple of fields ending in a unique field, for example `ordering = ('category', '-created_at', 'pk')`. The cursor carries the position of every ordering field and compares them lexicographically — in the same fashion as `QuerySet.order_by()`, respecting each field's ascending or descending direction — so rows that share the first field's value are still distinguished by the following fields instead of being skipped or duplicated across pages.
 * Should be a non-nullable value that can be coerced to a string.
 * Should not be a float. Precision errors easily lead to incorrect results. Hint: use decimals instead. (If you already have a float field and must paginate on that, an [example `CursorPagination` subclass that uses decimals to limit precision is available here][float_cursor_pagination_example].)
 * The field should have a database index.
@@ -138,6 +139,19 @@ By ensuring the final ordering field is unique and indexed (like id or a created
         queryset = SecureProduct.objects.all()
         serializer_class = SecureProductSerializer
         pagination_class = StandardCursorPagination
+
+    # 3. Recommended CursorPagination Usage with Composite Ordering
+    class CategoryCursorPagination(pagination.CursorPagination):
+        page_size = 10
+        # Groups rows by category, newest first, with 'pk' as a unique
+        # tie-breaker so the cursor position always stays stable even
+        # when several rows share the same category and creation time.
+        ordering = ('category', '-created_at', 'pk')
+
+    class ProductByCategoryViewSet(viewsets.ModelViewSet):
+        queryset = SecureProduct.objects.all()
+        serializer_class = SecureProductSerializer
+        pagination_class = CategoryCursorPagination
 
 ---
 
@@ -253,7 +267,7 @@ To set these attributes you should override the `LimitOffsetPagination` class, a
 
 The cursor-based pagination presents an opaque "cursor" indicator that the client may use to page through the result set. This pagination style only presents forward and reverse controls, and does not allow the client to navigate to arbitrary positions.
 
-Cursor based pagination requires that there is a unique, unchanging ordering of items in the result set. This ordering might typically be a creation timestamp on the records, as this presents a consistent ordering to paginate against.
+Cursor based pagination requires that there is a unique, unchanging ordering of items in the result set. This ordering might typically be a creation timestamp on the records, as this presents a consistent ordering to paginate against. It may also span several fields — for example `('category', '-created_at', 'pk')` — as long as the final field makes the ordering unique.
 
 Cursor based pagination is more complex than other schemes. It also requires that the result set presents a fixed ordering, and does not allow the client to arbitrarily index into the result set. However it does provide the following benefits:
 
@@ -281,7 +295,7 @@ To set these attributes you should override the `CursorPagination` class, and th
 
 * `page_size` = A numeric value indicating the page size. If set, this overrides the `PAGE_SIZE` setting. Defaults to the same value as the `PAGE_SIZE` settings key.
 * `cursor_query_param` = A string value indicating the name of the "cursor" query parameter. Defaults to `'cursor'`.
-* `ordering` = This should be a string, or list of strings, indicating the field against which the cursor based pagination will be applied. For example: `ordering = 'slug'`. Defaults to `-created`. This value may also be overridden by using `OrderingFilter` on the view.
+* `ordering` = This should be a string, or a list or tuple of strings, indicating the field (or fields) against which the cursor based pagination will be applied. For example: `ordering = 'slug'`, or `ordering = ('category', '-created_at', 'pk')`. When several fields are given, the cursor carries the position of every field and compares rows lexicographically in the same fashion as `QuerySet.order_by()`, respecting each field's ascending or descending direction; rows that share the first field's value keep being compared against the following fields. The last field should be unique (typically `'pk'`) so that the cursor position is always unambiguous — the "position plus offset" fallback only applies when the full composite position repeats. Note that `.values()` querysets return dictionaries keyed by the concrete primary key field name (eg. `'id'`), so use `'id'` rather than the `'pk'` alias when paginating those. Defaults to `-created`. This value may also be overridden by using `OrderingFilter` on the view.
 * `template` = The name of a template to use when rendering pagination controls in the browsable API. May be overridden to modify the rendering style, or set to `None` to disable HTML pagination controls completely. Defaults to `"rest_framework/pagination/previous_and_next.html"`.
 
 ---

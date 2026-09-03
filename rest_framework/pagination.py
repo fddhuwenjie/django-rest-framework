@@ -8,8 +8,10 @@ from base64 import b64decode, b64encode
 from collections import namedtuple
 from urllib import parse
 
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.paginator import InvalidPage
 from django.core.paginator import Paginator as DjangoPaginator
+from django.db.models import Q
 from django.template import loader
 from django.utils.encoding import force_str
 from django.utils.translation import gettext_lazy as _
@@ -564,24 +566,28 @@ class CursorPagination(BasePagination):
         else:
             queryset = queryset.order_by(*self.ordering)
 
-        # If we have a cursor with a fixed position then filter by that.
-        if current_position is not None:
-            order = self.ordering[0]
-            is_reversed = order.startswith('-')
-            order_attr = order.lstrip('-')
+        # A cursor position carries one value per ordering field.
+        # Cursors built directly (eg. in tests or subclasses) may still
+        # provide a single value, so normalize it to a tuple.
+        if current_position is not None and not isinstance(
+            current_position, (list, tuple)
+        ):
+            current_position = (current_position,)
 
-            # Test for: (cursor reversed) XOR (queryset reversed)
-            if self.cursor.reverse != is_reversed:
-                kwargs = {order_attr + '__lt': current_position}
-            else:
-                kwargs = {order_attr + '__gt': current_position}
+        try:
+            # If we have a cursor with a fixed position then filter by that.
+            if current_position is not None:
+                queryset = queryset.filter(
+                    self._get_position_filter(current_position, reverse)
+                )
 
-            queryset = queryset.filter(**kwargs)
+            # If we have an offset cursor then offset the entire page by that amount.
+            # We also always fetch an extra item in order to determine if there is a
+            # page following on from this one.
+            results = list(queryset[offset:offset + self.page_size + 1])
+        except (TypeError, ValueError, DjangoValidationError):
+            raise NotFound(self.invalid_cursor_message)
 
-        # If we have an offset cursor then offset the entire page by that amount.
-        # We also always fetch an extra item in order to determine if there is a
-        # page following on from this one.
-        results = list(queryset[offset:offset + self.page_size + 1])
         self.page = list(results[:self.page_size])
 
         # Determine the position of the final item following the page.
@@ -762,21 +768,25 @@ class CursorPagination(BasePagination):
             'Using cursor pagination, but no ordering attribute was declared '
             'on the pagination class.'
         )
-        assert '__' not in ordering, (
-            'Cursor pagination does not support double underscore lookups '
-            'for orderings. Orderings should be an unchanging, unique or '
-            'nearly-unique field on the model, such as "-created" or "pk".'
-        )
-
         assert isinstance(ordering, (str, list, tuple)), (
-            'Invalid ordering. Expected string or tuple, but got {type}'.format(
-                type=type(ordering).__name__
-            )
+            'Invalid ordering. Expected string, list or tuple, but got '
+            '{type}'.format(type=type(ordering).__name__)
         )
 
         if isinstance(ordering, str):
-            return (ordering,)
-        return tuple(ordering)
+            ordering = (ordering,)
+        else:
+            ordering = tuple(ordering)
+
+        assert not any('__' in field for field in ordering), (
+            'Cursor pagination does not support double underscore lookups '
+            'for orderings. Orderings should be an unchanging, unique or '
+            'nearly-unique field on the model, such as "-created" or "pk". '
+            'A tuple of fields may be used for composite orderings, such '
+            'as ("category", "-created", "pk").'
+        )
+
+        return ordering
 
     def decode_cursor(self, request):
         """
@@ -797,9 +807,20 @@ class CursorPagination(BasePagination):
             reverse = tokens.get('r', ['0'])[0]
             reverse = bool(int(reverse))
 
-            position = tokens.get('p', [None])[0]
+            positions = tokens.get('p')
         except (TypeError, ValueError):
             raise NotFound(self.invalid_cursor_message)
+
+        if positions is None:
+            position = None
+        else:
+            # The cursor carries one position value per ordering field.
+            # A cursor with missing or extra position values refers to a
+            # different ordering and cannot be applied.
+            ordering = getattr(self, 'ordering', None)
+            if ordering is not None and len(positions) != len(ordering):
+                raise NotFound(self.invalid_cursor_message)
+            position = tuple(positions)
 
         return Cursor(offset=offset, reverse=reverse, position=position)
 
@@ -813,6 +834,9 @@ class CursorPagination(BasePagination):
         if cursor.reverse:
             tokens['r'] = '1'
         if cursor.position is not None:
+            # A composite position is a tuple of values, one per ordering
+            # field. `doseq` serializes it as repeated `p` tokens, while a
+            # single value still produces a single `p` token.
             tokens['p'] = cursor.position
 
         querystring = parse.urlencode(tokens, doseq=True)
@@ -820,12 +844,63 @@ class CursorPagination(BasePagination):
         return replace_query_param(self.base_url, self.cursor_query_param, encoded)
 
     def _get_position_from_instance(self, instance, ordering):
-        field_name = ordering[0].lstrip('-')
-        if isinstance(instance, dict):
-            attr = instance[field_name]
-        else:
-            attr = getattr(instance, field_name)
-        return str(attr)
+        """
+        Return the full cursor position of an instance, as a tuple of
+        strings, one value per ordering field.
+        """
+        def get_field_value(field_name):
+            if isinstance(instance, dict):
+                if field_name == 'pk' and field_name not in instance:
+                    # `.values()` returns the concrete primary key field
+                    # name (eg. 'id') rather than the 'pk' alias.
+                    field_name = 'id'
+                attr = instance[field_name]
+            else:
+                attr = getattr(instance, field_name)
+            return str(attr)
+
+        return tuple(get_field_value(field.lstrip('-')) for field in ordering)
+
+    def _get_position_filter(self, position, is_reversed):
+        """
+        Build a `Q` object matching the rows strictly on the requested
+        side of the cursor position.
+
+        Rows are compared using the same lexicographic ordering as
+        `order_by`: the ordering fields are compared in turn, and a field
+        is only compared once all the preceding fields tie with the cursor
+        position. Ascending fields match greater values when paging
+        forward and smaller values when paging backwards; descending
+        fields do the opposite.
+        """
+        position_filter = None
+        for index, (ordering_field, field_position) in enumerate(
+            zip(self.ordering, position)
+        ):
+            is_reversed_order = ordering_field.startswith('-')
+            field_name = ordering_field.lstrip('-')
+
+            # All the preceding ordering fields must tie before this field
+            # is used to decide which side of the cursor a row is on.
+            term = Q()
+            for previous_index in range(index):
+                previous_field_name = self.ordering[previous_index].lstrip('-')
+                term &= Q(**{previous_field_name: position[previous_index]})
+
+            # Rows paging forward have greater values for ascending fields
+            # and smaller values for descending fields. Paging backwards
+            # flips the comparison for every field.
+            if is_reversed_order == is_reversed:
+                term &= Q(**{field_name + '__gt': field_position})
+            else:
+                term &= Q(**{field_name + '__lt': field_position})
+
+            if position_filter is None:
+                position_filter = term
+            else:
+                position_filter |= term
+
+        return position_filter
 
     def get_paginated_response(self, data):
         return Response({
